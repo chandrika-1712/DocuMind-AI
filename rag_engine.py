@@ -1,20 +1,22 @@
 
 """
 Short Description:
-Retrieve relevant document passages using semantic embeddings.
+Retrieve relevant document passages using Sentence Transformers and FAISS.
 
 Approach:
-1. Split extracted text into overlapping chunks.
-2. Convert each chunk into an embedding.
-3. Convert the user's question into an embedding.
-4. Rank chunks using cosine similarity.
-5. Return the most relevant passages as evidence.
+1. Split document text into overlapping chunks.
+2. Convert chunks into normalized sentence embeddings.
+3. Store embeddings in a FAISS vector index.
+4. Convert the user's question into an embedding.
+5. Retrieve the most similar passages using FAISS.
+6. Return passages with similarity scores for RAG.
 """
 
 import re
 
+import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -25,7 +27,7 @@ def split_into_chunks(
     chunk_size: int = 120,
     overlap: int = 25,
 ) -> list[str]:
-    """Split text into word-based chunks with overlap."""
+    """Split text into overlapping word-based chunks."""
 
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
@@ -36,17 +38,16 @@ def split_into_chunks(
         )
 
     words = re.findall(r"\S+", text)
-
     chunks = []
     step = chunk_size - overlap
 
     for start in range(0, len(words), step):
-        chunk_words = words[start:start + chunk_size]
+        chunk = words[start:start + chunk_size]
 
-        if not chunk_words:
+        if not chunk:
             break
 
-        chunks.append(" ".join(chunk_words))
+        chunks.append(" ".join(chunk))
 
         if start + chunk_size >= len(words):
             break
@@ -55,35 +56,51 @@ def split_into_chunks(
 
 
 class DocumentRetriever:
-    """Find document passages semantically related to a question."""
+    """Index document passages and retrieve them with FAISS."""
 
     def __init__(self):
         self.model = SentenceTransformer(MODEL_NAME)
         self.chunks = []
-        self.embeddings = None
+        self.index = None
 
     def index_document(self, text: str):
-        """Create searchable embeddings for a document."""
+        """Create a FAISS index for a document's passages."""
 
         self.chunks = split_into_chunks(text)
 
         if not self.chunks:
-            raise ValueError("The document contains no searchable text.")
+            self.index = None
+            raise ValueError(
+                "The document contains no searchable text."
+            )
 
-        self.embeddings = self.model.encode(
+        embeddings = self.model.encode(
             self.chunks,
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
 
-    def search(self, question: str, top_k: int = 3):
-        """Return the most relevant passages and similarity scores."""
+        # FAISS expects a contiguous float32 matrix.
+        embeddings = np.ascontiguousarray(
+            embeddings,
+            dtype=np.float32,
+        )
 
-        if self.embeddings is None:
+        # Normalized vectors + inner product = cosine similarity.
+        self.index = faiss.IndexFlatIP(embeddings.shape[1])
+        self.index.add(embeddings)
+
+    def search(self, question: str, top_k: int = 3) -> list[dict]:
+        """Return the most similar passages and their scores."""
+
+        if self.index is None:
             raise ValueError("Index a document before searching.")
 
         if not question.strip():
             raise ValueError("Please enter a question.")
+
+        if top_k <= 0:
+            raise ValueError("top_k must be positive.")
 
         question_embedding = self.model.encode(
             [question],
@@ -91,17 +108,29 @@ class DocumentRetriever:
             convert_to_numpy=True,
         )
 
-        scores = cosine_similarity(
+        question_embedding = np.ascontiguousarray(
             question_embedding,
-            self.embeddings,
-        )[0]
+            dtype=np.float32,
+        )
 
-        ranked_indices = scores.argsort()[::-1][:top_k]
+        k = min(top_k, len(self.chunks))
 
-        return [
-            {
-                "passage": self.chunks[index],
-                "similarity": float(scores[index]),
-            }
-            for index in ranked_indices
-        ]
+        scores, indices = self.index.search(
+            question_embedding,
+            k,
+        )
+
+        results = []
+
+        for score, index in zip(scores[0], indices[0]):
+            if index < 0:
+                continue
+
+            results.append(
+                {
+                    "passage": self.chunks[int(index)],
+                    "similarity": float(score),
+                }
+            )
+
+        return results

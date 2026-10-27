@@ -1,6 +1,18 @@
-
-.venv/
-__pycache__/
-.pytest_cache/
+# Secrets
 .env
-artifacts/
+.env.*
+
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Test cache
+.pytest_cache/
+
+# Local dataset cache
+datasets/
+
+# IDE settings
+.vscode/
